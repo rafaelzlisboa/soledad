@@ -14,14 +14,10 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
-
-
 """
 A U1DB backend for encrypting data before sending to server and decrypting
 after receiving.
 """
-
-
 import cStringIO
 import gzip
 import logging
@@ -34,13 +30,15 @@ from time import sleep
 from uuid import uuid4
 
 import simplejson as json
-from taskthread import TimerTask
+
 from u1db import errors
 from u1db.remote import utils, http_errors
 from u1db.remote.http_target import HTTPSyncTarget
 from u1db.remote.http_client import _encode_query_parameter, HTTPClientBase
 from zope.proxy import ProxyBase
 from zope.proxy import sameProxiedObjects, setProxiedObject
+
+from twisted.internet.task import LoopingCall
 
 from leap.soledad.common.document import SoledadDocument
 from leap.soledad.client.auth import TokenBasedAuth
@@ -84,7 +82,7 @@ class DocumentSyncerThread(threading.Thread):
     """
 
     def __init__(self, doc_syncer, release_method, failed_method,
-            idx, total, last_request_lock=None, last_callback_lock=None):
+                 idx, total, last_request_lock=None, last_callback_lock=None):
         """
         Initialize a new syncer thread.
 
@@ -190,7 +188,7 @@ class DocumentSyncerThread(threading.Thread):
                 self._doc_syncer.failure_callback(
                     self._idx, self._total, self._exception)
 
-                self._failed_method(self)
+                self._failed_method()
                 # we do not release the callback lock here because we
                 # failed and so we don't want other threads to succeed.
 
@@ -243,7 +241,7 @@ class DocumentSyncerPool(object):
     """
 
     def __init__(self, raw_url, raw_creds, query_string, headers,
-            ensure_callback, stop_method):
+                 ensure_callback, stop_method):
         """
         Initialize the document syncer pool.
 
@@ -276,7 +274,7 @@ class DocumentSyncerPool(object):
         self._threads = []
 
     def new_syncer_thread(self, idx, total, last_request_lock=None,
-            last_callback_lock=None):
+                          last_callback_lock=None):
         """
         Yield a new document syncer thread.
 
@@ -350,7 +348,7 @@ class DocumentSyncerPool(object):
                 self._threads.remove(syncer_thread)
             self._semaphore_pool.release()
 
-    def cancel_threads(self, calling_thread):
+    def cancel_threads(self):
         """
         Stop all threads in the pool.
         """
@@ -373,6 +371,12 @@ class DocumentSyncerPool(object):
             t.request_lock.release()
             t.callback_lock.acquire(False)  # just in case
             t.callback_lock.release()
+        # release any blocking semaphores
+        for i in xrange(DocumentSyncerPool.POOL_SIZE):
+            try:
+                self._semaphore_pool.release()
+            except ValueError:
+                break
         logger.warning("Soledad sync: cancelled sync threads.")
 
     def cleanup(self):
@@ -610,7 +614,7 @@ class HTTPDocumentSyncer(HTTPClientBase, TokenBasedAuth):
         self._conn.endheaders()
 
     def _get_doc(self, received, sync_id, last_known_generation,
-            last_known_trans_id):
+                 last_known_trans_id):
         """
         Get a sync document from server by means of a POST request.
 
@@ -649,7 +653,7 @@ class HTTPDocumentSyncer(HTTPClientBase, TokenBasedAuth):
         return self._response()
 
     def _put_doc(self, sync_id, last_known_generation, last_known_trans_id,
-            id, rev, content, gen, trans_id, number_of_docs, doc_idx):
+                 id, rev, content, gen, trans_id, number_of_docs, doc_idx):
         """
         Put a sync document on server by means of a POST request.
 
@@ -749,14 +753,14 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
     """
     Period of recurrence of the periodic decrypting task, in seconds.
     """
-    DECRYPT_TASK_PERIOD = 0.5
+    DECRYPT_LOOP_PERIOD = 0.5
 
     #
     # Modified HTTPSyncTarget methods.
     #
 
     def __init__(self, url, source_replica_uid=None, creds=None, crypto=None,
-            sync_db=None, sync_db_write_lock=None):
+                 sync_db=None, sync_db_write_lock=None):
         """
         Initialize the SoledadSyncTarget.
 
@@ -790,13 +794,14 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
         self._sync_exchange_lock = threading.Lock()
         self.source_replica_uid = source_replica_uid
         self._defer_decryption = False
+        self._syncer_pool = None
 
         # deferred decryption attributes
         self._sync_db = None
         self._sync_db_write_lock = None
         self._decryption_callback = None
         self._sync_decr_pool = None
-        self._sync_watcher = None
+        self._sync_loop = None
         if sync_db and sync_db_write_lock is not None:
             self._sync_db = sync_db
             self._sync_db_write_lock = sync_db_write_lock
@@ -822,23 +827,22 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
             self._sync_decr_pool.close()
             self._sync_decr_pool = None
 
-    def _setup_sync_watcher(self):
+    def _setup_sync_loop(self):
         """
-        Set up the sync watcher for deferred decryption.
+        Set up the sync loop for deferred decryption.
         """
-        if self._sync_watcher is None:
-            self._sync_watcher = TimerTask(
-                self._decrypt_syncing_received_docs,
-                delay=self.DECRYPT_TASK_PERIOD)
+        if self._sync_loop is None:
+            self._sync_loop = LoopingCall(
+                self._decrypt_syncing_received_docs)
+            self._sync_loop.start(self.DECRYPT_LOOP_PERIOD)
 
-    def _teardown_sync_watcher(self):
+    def _teardown_sync_loop(self):
         """
-        Tear down the sync watcher.
+        Tear down the sync loop.
         """
-        if self._sync_watcher is not None:
-            self._sync_watcher.stop()
-            self._sync_watcher.shutdown()
-            self._sync_watcher = None
+        if self._sync_loop is not None:
+            self._sync_loop.stop()
+            self._sync_loop = None
 
     def _get_replica_uid(self, url):
         """
@@ -913,7 +917,7 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
         """
         new_generation, new_transaction_id, number_of_changes, doc_id, \
             rev, content, gen, trans_id = \
-                self._parse_received_doc_response(response)
+            self._parse_received_doc_response(response)
         if doc_id is not None:
             # decrypt incoming document and insert into local database
             # -------------------------------------------------------------
@@ -949,7 +953,7 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
 
     def _get_remote_docs(self, url, last_known_generation, last_known_trans_id,
                          headers, return_doc_cb, ensure_callback, sync_id,
-                         syncer_pool, defer_decryption=False):
+                         defer_decryption=False):
         """
         Fetch sync documents from the remote database and insert them in the
         local database.
@@ -1010,7 +1014,7 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
                 break
 
             # launch a thread to fetch one document from target
-            t = syncer_pool.new_syncer_thread(
+            t = self._syncer_pool.new_syncer_thread(
                 idx, number_of_changes,
                 last_callback_lock=last_callback_lock)
 
@@ -1019,451 +1023,3 @@ class SoledadSyncTarget(HTTPSyncTarget, TokenBasedAuth):
                 self.stop()
                 break
 
-            t.doc_syncer.set_request_method(
-                'get', idx, sync_id, last_known_generation,
-                last_known_trans_id)
-            t.doc_syncer.set_success_callback(self._insert_received_doc)
-
-            def _failure_callback(idx, total, exception):
-                _failure_msg = "Soledad sync: error while getting document " \
-                    "%d/%d: %s" \
-                    % (idx + 1, total, exception)
-                logger.warning("%s" % _failure_msg)
-                logger.warning("Soledad sync: failing gracefully, will "
-                               "recover on next sync.")
-
-            t.doc_syncer.set_failure_callback(_failure_callback)
-            threads.append(t)
-            t.start()
-            last_callback_lock = t.callback_lock
-            idx += 1
-
-            # if this is the first request, wait to update the number of
-            # changes
-            if first_request is True:
-                t.join()
-                if t.success:
-                    number_of_changes, _, _ = t.result
-                first_request = False
-
-        # make sure all threads finished and we have up-to-date info
-        last_successful_thread = None
-        while threads:
-            # check if there are failures
-            t = threads.pop(0)
-            t.join()
-            if t.success:
-                last_successful_thread = t
-
-        # get information about last successful thread
-        if last_successful_thread is not None:
-            body, _ = last_successful_thread.response
-            parsed_body = json.loads(body)
-            # get current target gen and trans id in case no documents were
-            # transferred
-            if len(parsed_body) == 1:
-                metadata = parsed_body[0]
-                new_generation = metadata['new_generation']
-                new_transaction_id = metadata['new_transaction_id']
-            # get current target gen and trans id from last transferred
-            # document
-            else:
-                doc_data = parsed_body[1]
-                new_generation = doc_data['gen']
-                new_transaction_id = doc_data['trans_id']
-
-        return new_generation, new_transaction_id
-
-    def sync_exchange(self, docs_by_generations,
-                      source_replica_uid, last_known_generation,
-                      last_known_trans_id, return_doc_cb,
-                      ensure_callback=None, defer_decryption=True,
-                      sync_id=None):
-        """
-        Find out which documents the remote database does not know about,
-        encrypt and send them.
-
-        This does the same as the parent's method but encrypts content before
-        syncing.
-
-        :param docs_by_generations: A list of (doc_id, generation, trans_id)
-                                    of local documents that were changed since
-                                    the last local generation the remote
-                                    replica knows about.
-        :type docs_by_generations: list of tuples
-
-        :param source_replica_uid: The uid of the source replica.
-        :type source_replica_uid: str
-
-        :param last_known_generation: Target's last known generation.
-        :type last_known_generation: int
-
-        :param last_known_trans_id: Target's last known transaction id.
-        :type last_known_trans_id: str
-
-        :param return_doc_cb: A callback for inserting received documents from
-                              target. If not overriden, this will call u1db
-                              insert_doc_from_target in synchronizer, which
-                              implements the TAKE OTHER semantics.
-        :type return_doc_cb: function
-
-        :param ensure_callback: A callback that ensures we know the target
-                                replica uid if the target replica was just
-                                created.
-        :type ensure_callback: function
-
-        :param defer_decryption: Whether to defer the decryption process using
-                                 the intermediate database. If False,
-                                 decryption will be done inline.
-        :type defer_decryption: bool
-
-        :return: The new generation and transaction id of the target replica.
-        :rtype: tuple
-        """
-        self._ensure_callback = ensure_callback
-
-        if defer_decryption:
-            self._sync_exchange_lock.acquire()
-            self._setup_sync_decr_pool()
-            self._setup_sync_watcher()
-            self._defer_decryption = True
-
-        self.start()
-
-        if sync_id is None:
-            sync_id = str(uuid4())
-        self.source_replica_uid = source_replica_uid
-        # let the decrypter pool access the passed callback to insert docs
-        setProxiedObject(self._insert_doc_cb[source_replica_uid],
-                         return_doc_cb)
-
-        if not self.clear_to_sync():
-            raise PendingReceivedDocsSyncError
-
-        self._ensure_connection()
-        if self._trace_hook:  # for tests
-            self._trace_hook('sync_exchange')
-        url = '%s/sync-from/%s' % (self._url.path, source_replica_uid)
-        headers = self._sign_request('POST', url, {})
-
-        cur_target_gen = last_known_generation
-        cur_target_trans_id = last_known_trans_id
-
-        # send docs
-        msg = "%d/%d" % (0, len(docs_by_generations))
-        signal(SOLEDAD_SYNC_SEND_STATUS, msg)
-        logger.debug("Soledad sync send status: %s" % msg)
-
-        defer_encryption = self._sync_db is not None
-        syncer_pool = DocumentSyncerPool(
-            self._raw_url, self._raw_creds, url, headers, ensure_callback,
-            self.stop)
-        threads = []
-        last_request_lock = None
-        last_callback_lock = None
-        sent = 0
-        total = len(docs_by_generations)
-
-        synced = []
-        number_of_docs = len(docs_by_generations)
-
-        for doc, gen, trans_id in docs_by_generations:
-            # allow for interrupting the sync process
-            if self.stopped is True:
-                break
-
-            # skip non-syncable docs
-            if isinstance(doc, SoledadDocument) and not doc.syncable:
-                continue
-
-            # -------------------------------------------------------------
-            # symmetric encryption of document's contents
-            # -------------------------------------------------------------
-            doc_json = doc.get_json()
-            if not doc.is_tombstone():
-                if not defer_encryption:
-                    # fallback case, for tests
-                    doc_json = encrypt_doc(self._crypto, doc)
-                else:
-                    try:
-                        doc_json = self.get_encrypted_doc_from_db(
-                            doc.doc_id, doc.rev)
-                    except Exception as exc:
-                        logger.error("Error while getting "
-                                     "encrypted doc from db")
-                        logger.exception(exc)
-                        continue
-                    if doc_json is None:
-                        # Not marked as tombstone, but we got nothing
-                        # from the sync db. As it is not encrypted yet, we
-                        # force inline encryption.
-                        # TODO: implement a queue to deal with these cases.
-                        doc_json = encrypt_doc(self._crypto, doc)
-            # -------------------------------------------------------------
-            # end of symmetric encryption
-            # -------------------------------------------------------------
-            t = syncer_pool.new_syncer_thread(
-                sent + 1, total, last_request_lock=None,
-                last_callback_lock=last_callback_lock)
-
-            # bail out if any thread failed
-            if t is None:
-                self.stop()
-                break
-
-            # set the request method
-            t.doc_syncer.set_request_method(
-                'put', sync_id, cur_target_gen, cur_target_trans_id,
-                id=doc.doc_id, rev=doc.rev, content=doc_json, gen=gen,
-                trans_id=trans_id, number_of_docs=number_of_docs, doc_idx=sent + 1)
-            # set the success calback
-
-            def _success_callback(idx, total, response):
-                _success_msg = "Soledad sync send status: %d/%d" \
-                               % (idx, total)
-                signal(SOLEDAD_SYNC_SEND_STATUS, _success_msg)
-                logger.debug(_success_msg)
-
-            t.doc_syncer.set_success_callback(_success_callback)
-
-            # set the failure callback
-            def _failure_callback(idx, total, exception):
-                _failure_msg = "Soledad sync: error while sending document " \
-                               "%d/%d: %s" % (idx, total, exception)
-                logger.warning("%s" % _failure_msg)
-                logger.warning("Soledad sync: failing gracefully, will "
-                               "recover on next sync.")
-
-            t.doc_syncer.set_failure_callback(_failure_callback)
-
-            # save thread and append
-            t.start()
-            threads.append((t, doc))
-            last_request_lock = t.request_lock
-            last_callback_lock = t.callback_lock
-            sent += 1
-
-        # make sure all threads finished and we have up-to-date info
-        while threads:
-            # check if there are failures
-            t, doc = threads.pop(0)
-            t.join()
-            if t.success:
-                synced.append((doc.doc_id, doc.rev))
-
-        if defer_decryption:
-            self._sync_watcher.start()
-
-        # get docs from target
-        if self.stopped is False:
-            cur_target_gen, cur_target_trans_id = self._get_remote_docs(
-                url,
-                last_known_generation, last_known_trans_id, headers,
-                return_doc_cb, ensure_callback, sync_id, syncer_pool,
-                defer_decryption=defer_decryption)
-        syncer_pool.cleanup()
-
-        # delete documents from the sync database
-        if defer_encryption:
-            self.delete_encrypted_docs_from_db(synced)
-
-        # wait for deferred decryption to finish
-        if defer_decryption:
-            while self.clear_to_sync() is False:
-                sleep(self.DECRYPT_TASK_PERIOD)
-            self._teardown_sync_watcher()
-            self._teardown_sync_decr_pool()
-            self._sync_exchange_lock.release()
-
-        self.stop()
-        return cur_target_gen, cur_target_trans_id
-
-    def start(self):
-        """
-        Mark current sync session as running.
-        """
-        with self._stop_lock:
-            self._stopped = False
-
-    def stop(self):
-        """
-        Mark current sync session as stopped.
-
-        This will eventually interrupt the sync_exchange() method and return
-        enough information to the synchronizer so the sync session can be
-        recovered afterwards.
-        """
-        with self._stop_lock:
-            self._stopped = True
-
-    @property
-    def stopped(self):
-        """
-        Return whether this sync session is stopped.
-
-        :return: Whether this sync session is stopped.
-        :rtype: bool
-        """
-        with self._stop_lock:
-            return self._stopped is True
-
-    def get_encrypted_doc_from_db(self, doc_id, doc_rev):
-        """
-        Retrieve encrypted document from the database of encrypted docs for
-        sync.
-
-        :param doc_id: The Document id.
-        :type doc_id: str
-
-        :param doc_rev: The document revision
-        :type doc_rev: str
-        """
-        encr = SyncEncrypterPool
-        c = self._sync_db.cursor()
-        sql = ("SELECT content FROM %s WHERE doc_id=? and rev=?" % (
-            encr.TABLE_NAME,))
-        c.execute(sql, (doc_id, doc_rev))
-        res = c.fetchall()
-        if len(res) != 0:
-            return res[0][0]
-
-    def delete_encrypted_docs_from_db(self, docs_ids):
-        """
-        Delete several encrypted documents from the database of symmetrically
-        encrypted docs to sync.
-
-        :param docs_ids: an iterable with (doc_id, doc_rev) for all documents
-                         to be deleted.
-        :type docs_ids: any iterable of tuples of str
-        """
-        if docs_ids:
-            encr = SyncEncrypterPool
-            c = self._sync_db.cursor()
-            for doc_id, doc_rev in docs_ids:
-                sql = ("DELETE FROM %s WHERE doc_id=? and rev=?" % (
-                    encr.TABLE_NAME,))
-                c.execute(sql, (doc_id, doc_rev))
-            self._sync_db.commit()
-
-    def _save_encrypted_received_doc(self, doc, gen, trans_id, idx, total):
-        """
-        Save a symmetrically encrypted incoming document into the received
-        docs table in the sync db. A decryption task will pick it up
-        from here in turn.
-
-        :param doc: The document to save.
-        :type doc: SoledadDocument
-        :param gen: The generation.
-        :type gen: str
-        :param  trans_id: Transacion id.
-        :type gen: str
-        :param idx: The index count of the current operation.
-        :type idx: int
-        :param total: The total number of operations.
-        :type total: int
-        """
-        logger.debug(
-            "Enqueueing doc for decryption: %d/%d."
-            % (idx + 1, total))
-        self._sync_decr_pool.insert_encrypted_received_doc(
-            doc.doc_id, doc.rev, doc.content, gen, trans_id)
-
-    def _save_received_doc(self, doc, gen, trans_id, idx, total):
-        """
-        Save any incoming document into the received docs table in the sync db.
-
-        :param doc: The document to save.
-        :type doc: SoledadDocument
-        :param gen: The generation.
-        :type gen: str
-        :param  trans_id: Transacion id.
-        :type gen: str
-        :param idx: The index count of the current operation.
-        :type idx: int
-        :param total: The total number of operations.
-        :type total: int
-        """
-        logger.debug(
-            "Enqueueing doc, no decryption needed: %d/%d."
-            % (idx + 1, total))
-        self._sync_decr_pool.insert_received_doc(
-            doc.doc_id, doc.rev, doc.content, gen, trans_id)
-
-    #
-    # Symmetric decryption of syncing docs
-    #
-
-    def clear_to_sync(self):
-        """
-        Return True if sync can proceed (ie, the received db table is empty).
-        :rtype: bool
-        """
-        if self._sync_decr_pool is not None:
-            return self._sync_decr_pool.count_received_encrypted_docs() == 0
-        else:
-            return True
-
-    def set_decryption_callback(self, cb):
-        """
-        Set callback to be called when the decryption finishes.
-
-        :param cb: The callback to be set.
-        :type cb: callable
-        """
-        self._decryption_callback = cb
-
-    def has_decryption_callback(self):
-        """
-        Return True if there is a decryption callback set.
-        :rtype: bool
-        """
-        return self._decryption_callback is not None
-
-    def has_syncdb(self):
-        """
-        Return True if we have an initialized syncdb.
-        """
-        return self._sync_db is not None
-
-    def _decrypt_syncing_received_docs(self):
-        """
-        Decrypt the documents received from remote replica and insert them
-        into the local one.
-
-        Called periodically from TimerTask self._sync_watcher.
-        """
-        if sameProxiedObjects(
-                self._insert_doc_cb.get(self.source_replica_uid),
-                None):
-            return
-
-        decrypter = self._sync_decr_pool
-        decrypter.decrypt_received_docs()
-        done = decrypter.process_decrypted()
-
-    def _sign_request(self, method, url_query, params):
-        """
-        Return an authorization header to be included in the HTTP request.
-
-        :param method: The HTTP method.
-        :type method: str
-        :param url_query: The URL query string.
-        :type url_query: str
-        :param params: A list with encoded query parameters.
-        :type param: list
-
-        :return: The Authorization header.
-        :rtype: list of tuple
-        """
-        return TokenBasedAuth._sign_request(self, method, url_query, params)
-
-    def set_token_credentials(self, uuid, token):
-        """
-        Store given credentials so we can sign the request later.
-
-        :param uuid: The user's uuid.
-        :type uuid: str
-        :param token: The authentication token.
-        :type token: str
-        """
-        TokenBasedAuth.set_token_credentials(self, uuid, token)

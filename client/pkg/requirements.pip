@@ -6,19 +6,12 @@ pycryptopp
 
 # cchardet not packaged, we need python-chardet from the
 # repos instead.
-chardet
 zope.proxy
-
-#
-# leap deps
-#
+twisted
 
 leap.soledad.common>=0.6.0
 
-#
-# XXX things to fix yet:
-#
-
-# this is not strictly needed by us, but we need it
-# until u1db adds it to its release as a dep.
+# XXX -- fix me!
+# oauth is not strictly needed by us, but we need it until u1db adds it to its
+# release as a dep.
 oauth
