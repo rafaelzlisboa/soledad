@@ -665,7 +665,7 @@ class Soledad(object):
 
         # TODO catch the exception by adding an Errback
         except Exception as e:
-            logger.error("Soledad exception when syncing: %s" % str(e))
+            logger.error("Soledad exception when syncing: %s" % e.message)
 
     def stop_sync(self):
         self._dbsyncer.stop_sync()
